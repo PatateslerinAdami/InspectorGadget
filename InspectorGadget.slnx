@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="InspectorGadget/InspectorGadget.csproj" />
+  <Project Path="ReplayFiles.Core/ReplayFiles.Core.csproj" />
+  <Project Path="ReplayFiles.Infrastructure/ReplayFiles.Infrastructure.csproj" />
+</Solution>
