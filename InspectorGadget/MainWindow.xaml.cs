@@ -7,11 +7,15 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Text.Json.Serialization;
+using ReplayFiles.Core.GamePackets;
 
 namespace InspectorGadget
 {
@@ -21,11 +25,15 @@ namespace InspectorGadget
         public string CsvFolder { get; set; } = "";
     }
 
+    public enum LogCategory { None, Spell, Missile, Buff, VFX, Animation, LookAt }
+
     public partial class MainWindow : Window
     {
         private Dictionary<uint, string> _spellHashes = new Dictionary<uint, string>();
         private Dictionary<uint, string> _buffHashes = new Dictionary<uint, string>();
         private Dictionary<uint, string> _vfxHashes = new Dictionary<uint, string>();
+
+        private CancellationTokenSource _scanCts;
 
         private JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
         {
@@ -34,6 +42,16 @@ namespace InspectorGadget
             Converters = { new JsonStringEnumConverter() }
         };
         private readonly string _settingsFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
+
+        private class DumpEvent
+        {
+            public string TimeStr { get; set; }
+            public object ParsedData { get; set; }
+            public HashSet<uint> InvolvedNetIds { get; set; } = new HashSet<uint>();
+            public LogCategory Category { get; set; }
+            public string LogText { get; set; }
+            public Brush Color { get; set; }
+        }
 
         public MainWindow()
         {
@@ -71,6 +89,20 @@ namespace InspectorGadget
             catch { }
         }
 
+        private CheckBox GetCheckBoxForCategory(LogCategory category)
+        {
+            return category switch
+            {
+                LogCategory.Spell => ChkSpells,
+                LogCategory.Missile => ChkMissiles,
+                LogCategory.Buff => ChkBuffs,
+                LogCategory.VFX => ChkVFX,
+                LogCategory.Animation => ChkAnimations,
+                LogCategory.LookAt => ChkLookAt,
+                _ => null
+            };
+        }
+
         private void LogMessage(string message, Brush color = null)
         {
             Dispatcher.InvokeAsync(() =>
@@ -80,7 +112,7 @@ namespace InspectorGadget
             });
         }
 
-        private StackPanel AddLogExpander(string header, Brush color, object rawData)
+        private StackPanel AddLogExpander(string header, Brush color, object rawData, LogCategory category = LogCategory.None)
         {
             StackPanel innerPanel = null;
             Dispatcher.Invoke(() =>
@@ -102,12 +134,17 @@ namespace InspectorGadget
 
                 innerPanel.Children.Add(dataExpander);
                 expander.Content = innerPanel;
+
+                var cb = GetCheckBoxForCategory(category);
+                if (cb != null)
+                    expander.SetBinding(UIElement.VisibilityProperty, new Binding("IsChecked") { Source = cb, Converter = (IValueConverter)FindResource("BoolToVis") });
+
                 OutputStack.Children.Add(expander);
             });
             return innerPanel;
         }
 
-        private void AddSubLog(StackPanel parentPanel, string text, Brush color, object rawData)
+        private void AddSubLog(StackPanel parentPanel, string text, Brush color, object rawData, LogCategory category)
         {
             Dispatcher.InvokeAsync(() =>
             {
@@ -122,22 +159,28 @@ namespace InspectorGadget
                     TextWrapping = TextWrapping.Wrap
                 };
                 expander.Content = rawDataText;
+
+                var cb = GetCheckBoxForCategory(category);
+                if (cb != null)
+                    expander.SetBinding(UIElement.VisibilityProperty, new Binding("IsChecked") { Source = cb, Converter = (IValueConverter)FindResource("BoolToVis") });
+
                 parentPanel.Children.Add(expander);
             });
         }
 
-        private void AddFileHeaderWithButton(string fileName, string filePath, string targetChampion)
+        private void AddFileHeaderWithButton(string fileName, string filePath, string targetChampion, string targetEntity)
         {
             Dispatcher.InvokeAsync(() =>
             {
-                var panel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 5) };
+                var panel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 15, 0, 5) };
                 var tb = new TextBlock { Text = $"[FILE] {fileName}", Foreground = Brushes.White, FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
 
-                var btn = new Button { Content = $"Show ALL Events for {targetChampion}", Padding = new Thickness(5, 2, 5, 2), Background = Brushes.DarkSlateBlue, Foreground = Brushes.White };
-                btn.Click += (s, e) => ShowAllChampionEvents(filePath, targetChampion);
+                string target = !string.IsNullOrEmpty(targetChampion) ? targetChampion : targetEntity;
+                var btn = new Button { Content = $"Show ALL Events for {target}", Padding = new Thickness(10, 2, 10, 2), Background = new SolidColorBrush(Color.FromRgb(72, 61, 139)), Foreground = Brushes.White, BorderThickness = new Thickness(0) };
+                btn.Click += (s, e) => ShowAllChampionEvents(filePath, targetChampion, targetEntity);
 
                 panel.Children.Add(tb);
-                if (!string.IsNullOrEmpty(targetChampion)) panel.Children.Add(btn);
+                if (!string.IsNullOrEmpty(target)) panel.Children.Add(btn);
 
                 OutputStack.Children.Add(panel);
             });
@@ -200,6 +243,12 @@ namespace InspectorGadget
             return dict.TryGetValue(hash, out string name) ? name : $"0x{hash:X8}";
         }
 
+        private string GetEntityName(uint netId, Dictionary<uint, string> netIdToName)
+        {
+            if (netId == 0) return "None";
+            return netIdToName.TryGetValue(netId, out string name) ? $"{name} ({netId})" : $"Unknown ({netId})";
+        }
+
         private ReplayMetadata ReadMetadataFast(string filePath)
         {
             try
@@ -221,16 +270,90 @@ namespace InspectorGadget
                 : TimeSpan.FromMilliseconds(realTimeMs).ToString(@"mm\:ss\.fff");
         }
 
+        private void ProcessNameMapping(object parsedData, Dictionary<uint, string> netIdToName, Dictionary<string, int> nameCounts, HashSet<uint> targetNetIds, string targetChampion, string targetEntity)
+        {
+            if (parsedData == null) return;
+
+            string baseName = null;
+            uint foundNetId = 0;
+
+            if (parsedData is CreateHeroData hero)
+            {
+                baseName = hero.Skin;
+                foundNetId = hero.NetID;
+            }
+            else if (parsedData is SpawnMinionS2CData minion)
+            {
+                baseName = string.IsNullOrEmpty(minion.Name) ? minion.SkinName : minion.Name;
+                foundNetId = minion.NetID;
+            }
+            else if (parsedData is SpawnBotS2CData bot)
+            {
+                baseName = bot.SkinName;
+                foundNetId = bot.NetID;
+            }
+            else if (parsedData is SpawnLevelPropS2CData prop)
+            {
+                baseName = prop.PropName;
+                foundNetId = prop.NetID;
+            }
+            else if (parsedData is S2C_SpawnTurretData turret)
+            {
+                baseName = turret.Name;
+                foundNetId = turret.NetID;
+            }
+            else if (parsedData is OnEnterVisibilityClientData visData)
+            {
+                foreach (var embedded in visData.EmbeddedPackets)
+                {
+                    ProcessNameMapping(embedded, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
+                }
+                foreach (var stack in visData.CharacterDataStack)
+                {
+                    RegisterEntity(stack.SkinName, stack.NetID, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
+                }
+            }
+
+            if (baseName != null && foundNetId != 0)
+            {
+                RegisterEntity(baseName, foundNetId, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
+            }
+        }
+
+        private void RegisterEntity(string baseName, uint netId, Dictionary<uint, string> netIdToName, Dictionary<string, int> nameCounts, HashSet<uint> targetNetIds, string targetChampion, string targetEntity)
+        {
+            if (netIdToName.ContainsKey(netId)) return;
+
+            if (!nameCounts.ContainsKey(baseName)) nameCounts[baseName] = 1;
+            else nameCounts[baseName]++;
+
+            string indexedName = nameCounts[baseName] > 1 ? $"{baseName}_{nameCounts[baseName]}" : baseName;
+            netIdToName[netId] = indexedName;
+
+            if ((!string.IsNullOrEmpty(targetChampion) && baseName.Replace(" ", "").Equals(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrEmpty(targetEntity) && baseName.Replace(" ", "").Equals(targetEntity.Replace(" ", ""), StringComparison.OrdinalIgnoreCase)))
+            {
+                targetNetIds.Add(netId);
+            }
+        }
+
         private async void ScanButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_scanCts != null)
+            {
+                _scanCts.Cancel();
+                return;
+            }
+
             string folderPath = FolderPathTextBox.Text;
             string spellName = SpellNameTextBox.Text.Trim();
             string targetChampion = ChampionTextBox.Text.Trim();
+            string targetEntity = EntityTextBox.Text.Trim();
 
             if (string.IsNullOrEmpty(folderPath)) return;
-            if (string.IsNullOrEmpty(spellName) && string.IsNullOrEmpty(targetChampion))
+            if (string.IsNullOrEmpty(spellName) && string.IsNullOrEmpty(targetChampion) && string.IsNullOrEmpty(targetEntity))
             {
-                LogMessage("Please enter either a Champion or a Spell Name!", Brushes.Red);
+                LogMessage("Please enter a Champion, Entity, or Spell Name!", Brushes.Red);
                 return;
             }
 
@@ -240,177 +363,204 @@ namespace InspectorGadget
             int maxOccurrences = int.Parse(MaxOccurrencesTextBox.Text);
             uint targetHash = string.IsNullOrEmpty(spellName) ? 0 : HashString(spellName);
 
-            ScanButton.IsEnabled = false;
+            bool includeTargeted = ChkIncludeTargeted.IsChecked == true;
+
+            _scanCts = new CancellationTokenSource();
+            var token = _scanCts.Token;
+
+            ScanButton.Content = "Stop Scan";
+            ScanButton.Background = Brushes.DarkRed;
+            ScanButton.Foreground = Brushes.White;
+
             OutputStack.Children.Clear();
 
             if (targetHash != 0) LogMessage($"Searching for Spell: '{spellName}' (Hash: 0x{targetHash:X8})", Brushes.Cyan);
-            else LogMessage($"Discovery Mode: Tracking ALL spells cast by '{targetChampion}'", Brushes.Cyan);
+            else LogMessage($"Discovery Mode: Tracking events for '{(!string.IsNullOrEmpty(targetChampion) ? targetChampion : targetEntity)}'", Brushes.Cyan);
 
-            await Task.Run(() =>
+            try
             {
-                int occurrencesFound = 0;
-                var files = Directory.EnumerateFiles(folderPath, "*.lrf", SearchOption.AllDirectories).ToList();
-                LogMessage($"Found {files.Count} total .lrf files. Starting scan...\n", Brushes.White);
-
-                Dictionary<uint, string> discoveredSpells = new Dictionary<uint, string>();
-
-                for (int i = 0; i < files.Count; i++)
+                await Task.Run(() =>
                 {
-                    if (occurrencesFound >= maxOccurrences) break;
+                    int occurrencesFound = 0;
+                    var files = Directory.EnumerateFiles(folderPath, "*.lrf", SearchOption.AllDirectories).ToList();
+                    LogMessage($"Found {files.Count} total .lrf files. Starting scan...\n", Brushes.White);
 
-                    string file = files[i];
-                    if (!string.IsNullOrEmpty(targetChampion))
+                    Dictionary<uint, string> discoveredSpells = new Dictionary<uint, string>();
+
+                    for (int i = 0; i < files.Count; i++)
                     {
-                        var metadata = ReadMetadataFast(file);
-                        if (metadata == null || metadata.Players == null) continue;
-                        if (!metadata.Players.Any(p => p.Champion.Replace(" ", "").Equals(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase))) continue;
-                    }
+                        if (token.IsCancellationRequested) break;
+                        if (occurrencesFound >= maxOccurrences) break;
 
-                    AddFileHeaderWithButton(Path.GetFileName(file), file, targetChampion);
+                        string file = files[i];
+                        bool fileHeaderAdded = false;
 
-                    try
-                    {
-                        using FileStream stream = File.OpenRead(file);
-                        var packets = new ReplayReader().Parse(stream).ToList();
-
-                        float gameStartTime = 0;
-                        foreach (var p in packets)
+                        if (!string.IsNullOrEmpty(targetChampion))
                         {
-                            if (p.Payload.Length > 0 && p.Payload.Span[0] == 0x5C)
-                            {
-                                gameStartTime = p.Time;
-                                break;
-                            }
+                            var metadata = ReadMetadataFast(file);
+                            if (metadata == null || metadata.Players == null) continue;
+                            if (!metadata.Players.Any(p => p.Champion.Replace(" ", "").Equals(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase))) continue;
+
+                            AddFileHeaderWithButton(Path.GetFileName(file), file, targetChampion, targetEntity);
+                            fileHeaderAdded = true;
                         }
 
-                        var activeTrackers = new List<(float EndTimeMs, uint CasterNetId, StackPanel UIContainer)>();
-                        uint targetChampionNetId = 0;
-
-                        foreach (var packet in packets)
+                        try
                         {
-                            if (packet.Payload.Length == 0) continue;
-                            byte packetId = packet.Payload.Span[0];
-                            float realTimeMs = packet.Time - gameStartTime;
-                            string timeStr = FormatTime(realTimeMs);
+                            using FileStream stream = File.OpenRead(file);
+                            var packets = new ReplayReader().Parse(stream).ToList();
 
-                            if (packetId == 0x4C && packet.ParsedData is CreateHeroData heroData)
+                            float gameStartTime = packets.FirstOrDefault(p => p.Payload.Length > 0 && p.Payload.Span[0] == 0x5C)?.Time ?? 0;
+
+                            var activeTrackers = new List<(float EndTimeMs, uint CasterNetId, StackPanel UIContainer)>();
+                            HashSet<uint> targetNetIds = new HashSet<uint>();
+                            Dictionary<uint, string> netIdToName = new Dictionary<uint, string>();
+                            Dictionary<string, int> nameCounts = new Dictionary<string, int>();
+
+                            foreach (var packet in packets)
                             {
-                                if (!string.IsNullOrEmpty(targetChampion) && heroData.Skin.Replace(" ", "").Equals(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase))
-                                    targetChampionNetId = heroData.NetID;
-                            }
+                                if (token.IsCancellationRequested) break;
+                                if (packet.Payload.Length == 0) continue;
 
-                            if (packetId == 0xB5 && packet.ParsedData is NPC_CastSpellAnsData castData)
-                            {
-                                bool isMatch = (targetHash != 0 && castData.SpellHash == targetHash) ||
-                                               (targetHash == 0 && targetChampionNetId != 0 && castData.CasterNetID == targetChampionNetId);
+                                uint packetId = packet.PacketId;
+                                float realTimeMs = packet.Time - gameStartTime;
+                                string timeStr = FormatTime(realTimeMs);
 
-                                if (isMatch)
+                                ProcessNameMapping(packet.ParsedData, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
+
+                                if (packetId == 0xB5 && packet.ParsedData is NPC_CastSpellAnsData castData)
                                 {
-                                    occurrencesFound++;
-                                    string castedSpellName = discoveredSpells.TryGetValue(castData.SpellHash, out string knownName) ? knownName : GetNameFromHash(castData.SpellHash, _spellHashes);
+                                    bool spellMatch = targetHash == 0 || castData.SpellHash == targetHash;
+                                    bool isCaster = targetNetIds.Count == 0 || targetNetIds.Contains(castData.CasterNetID);
+                                    bool isTarget = includeTargeted && castData.TargetNetIDs.Any(id => targetNetIds.Contains(id));
 
-                                    string header = $"[{timeStr}] [OCCURRENCE #{occurrencesFound}] Spell '{castedSpellName}' casted!";
-                                    var uiContainer = AddLogExpander(header, Brushes.Yellow, castData);
-
-                                    activeTrackers.Add((realTimeMs + trackDuration, castData.CasterNetID, uiContainer));
-                                }
-                            }
-                            else if (packetId == 0x3B && packet.ParsedData is MissileReplicationData misData)
-                            {
-                                bool isMatch = (targetHash != 0 && misData.SpellHash == targetHash) ||
-                                               (targetHash == 0 && targetChampionNetId != 0 && misData.CasterNetID == targetChampionNetId);
-
-                                if (isMatch)
-                                {
-                                    occurrencesFound++;
-                                    string castedSpellName = discoveredSpells.TryGetValue(misData.SpellHash, out string knownName) ? knownName : GetNameFromHash(misData.SpellHash, _spellHashes);
-
-                                    string header = $"[{timeStr}] [OCCURRENCE #{occurrencesFound}] Missile '{castedSpellName}' spawned!";
-                                    var uiContainer = AddLogExpander(header, Brushes.Orange, misData);
-
-                                    activeTrackers.Add((realTimeMs + trackDuration, misData.CasterNetID, uiContainer));
-                                }
-                            }
-
-                            activeTrackers.RemoveAll(t => realTimeMs > t.EndTimeMs);
-
-                            if (activeTrackers.Count > 0)
-                            {
-                                foreach (var tracker in activeTrackers)
-                                {
-                                    float timeOffsetMs = realTimeMs - (tracker.EndTimeMs - trackDuration);
-
-                                    if (packetId == 0xB7 && packet.ParsedData is NPC_BuffAdd2Data buffData)
+                                    if (spellMatch && (isCaster || isTarget))
                                     {
-                                        if (buffData.CasterNetID == tracker.CasterNetId || buffData.RoutingNetID == tracker.CasterNetId)
-                                        {
-                                            string buffName = GetNameFromHash(buffData.BuffNameHash, _buffHashes);
-                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] BUFF ADDED: {buffName}", Brushes.LightPink, buffData);
-                                            if (!discoveredSpells.ContainsKey(buffData.BuffNameHash) && !buffName.StartsWith("0x")) discoveredSpells[buffData.BuffNameHash] = buffName;
-                                        }
+                                        if (!fileHeaderAdded) { AddFileHeaderWithButton(Path.GetFileName(file), file, targetChampion, targetEntity); fileHeaderAdded = true; }
+
+                                        occurrencesFound++;
+                                        string castedSpellName = discoveredSpells.TryGetValue(castData.SpellHash, out string knownName) ? knownName : GetNameFromHash(castData.SpellHash, _spellHashes);
+                                        string casterName = GetEntityName(castData.CasterNetID, netIdToName);
+
+                                        string header = $"[{timeStr}] [OCCURRENCE #{occurrencesFound}] Spell '{castedSpellName}' casted by {casterName}!";
+                                        var uiContainer = AddLogExpander(header, Brushes.Yellow, castData, LogCategory.None);
+                                        activeTrackers.Add((realTimeMs + trackDuration, castData.CasterNetID, uiContainer));
                                     }
-                                    else if (packetId == 0x87 && packet.ParsedData is FXCreateGroupPacketData fxData)
+                                }
+                                else if (packetId == 0x3B && packet.ParsedData is MissileReplicationData misData)
+                                {
+                                    bool spellMatch = targetHash == 0 || misData.SpellHash == targetHash;
+                                    bool isCaster = targetNetIds.Count == 0 || targetNetIds.Contains(misData.CasterNetID);
+
+                                    if (spellMatch && isCaster)
                                     {
-                                        foreach (var group in fxData.Groups)
+                                        if (!fileHeaderAdded) { AddFileHeaderWithButton(Path.GetFileName(file), file, targetChampion, targetEntity); fileHeaderAdded = true; }
+
+                                        occurrencesFound++;
+                                        string castedSpellName = discoveredSpells.TryGetValue(misData.SpellHash, out string knownName) ? knownName : GetNameFromHash(misData.SpellHash, _spellHashes);
+                                        string casterName = GetEntityName(misData.CasterNetID, netIdToName);
+
+                                        string header = $"[{timeStr}] [OCCURRENCE #{occurrencesFound}] Missile '{castedSpellName}' spawned by {casterName}!";
+                                        var uiContainer = AddLogExpander(header, Brushes.Orange, misData, LogCategory.None);
+                                        activeTrackers.Add((realTimeMs + trackDuration, misData.CasterNetID, uiContainer));
+                                    }
+                                }
+
+                                activeTrackers.RemoveAll(t => realTimeMs > t.EndTimeMs);
+
+                                if (activeTrackers.Count > 0)
+                                {
+                                    foreach (var tracker in activeTrackers)
+                                    {
+                                        float timeOffsetMs = realTimeMs - (tracker.EndTimeMs - trackDuration);
+
+                                        if (packetId == 0xB7 && packet.ParsedData is NPC_BuffAdd2Data buffData)
                                         {
-                                            foreach (var fx in group.FXCreateData)
+                                            bool isCaster = buffData.CasterNetID == tracker.CasterNetId;
+                                            bool isTarget = includeTargeted && buffData.RoutingNetID == tracker.CasterNetId;
+
+                                            if (isCaster || isTarget)
                                             {
-                                                if (fx.TargetNetID == tracker.CasterNetId || fx.CasterNetID == tracker.CasterNetId)
+                                                string buffName = GetNameFromHash(buffData.BuffNameHash, _buffHashes);
+                                                string targetName = GetEntityName(buffData.RoutingNetID, netIdToName);
+                                                string casterName = GetEntityName(buffData.CasterNetID, netIdToName);
+                                                AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] BUFF: {buffName} | Caster: {casterName} -> Target: {targetName}", Brushes.LightPink, buffData, LogCategory.Buff);
+                                                if (!discoveredSpells.ContainsKey(buffData.BuffNameHash) && !buffName.StartsWith("0x")) discoveredSpells[buffData.BuffNameHash] = buffName;
+                                            }
+                                        }
+                                        else if (packetId == 0x87 && packet.ParsedData is FXCreateGroupPacketData fxData)
+                                        {
+                                            foreach (var group in fxData.Groups)
+                                            {
+                                                foreach (var fx in group.FXCreateData)
                                                 {
-                                                    string vfxName = GetNameFromHash(group.EffectNameHash, _vfxHashes);
-                                                    AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] VFX SPAWNED: {vfxName}", Brushes.LightSkyBlue, group);
-                                                    if (!discoveredSpells.ContainsKey(group.EffectNameHash) && !vfxName.StartsWith("0x")) discoveredSpells[group.EffectNameHash] = vfxName.Replace(".troy", "");
+                                                    bool isCaster = fx.CasterNetID == tracker.CasterNetId;
+                                                    bool isTarget = includeTargeted && fx.TargetNetID == tracker.CasterNetId;
+
+                                                    if (isCaster || isTarget)
+                                                    {
+                                                        string vfxName = GetNameFromHash(group.EffectNameHash, _vfxHashes);
+                                                        string casterName = GetEntityName(fx.CasterNetID, netIdToName);
+                                                        string targetName = GetEntityName(fx.TargetNetID, netIdToName);
+                                                        AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] VFX: {vfxName} | Caster: {casterName} -> Target: {targetName}", Brushes.LightSkyBlue, group, LogCategory.VFX);
+                                                        if (!discoveredSpells.ContainsKey(group.EffectNameHash) && !vfxName.StartsWith("0x")) discoveredSpells[group.EffectNameHash] = vfxName.Replace(".troy", "");
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    else if (packetId == 0x3B && packet.ParsedData is MissileReplicationData subMisData)
-                                    {
-                                        if (subMisData.CasterNetID == tracker.CasterNetId)
+                                        else if (packetId == 0xB0 && packet.ParsedData is S2C_PlayAnimationData animData && animData.RoutingNetID == tracker.CasterNetId)
                                         {
-                                            string misName = GetNameFromHash(subMisData.SpellHash, _spellHashes);
-                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] MISSILE SPAWNED: {misName}", Brushes.Orange, subMisData);
+                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] ANIMATION PLAYED: {animData.AnimationName}", Brushes.MediumPurple, animData, LogCategory.Animation);
+                                        }
+                                        else if (packetId == 0x10F && packet.ParsedData is S2C_UnitSetLookAtData lookAtData)
+                                        {
+                                            bool isActor = lookAtData.RoutingNetID == tracker.CasterNetId;
+                                            bool isTarget = includeTargeted && lookAtData.TargetNetID == tracker.CasterNetId;
+
+                                            if (isActor || isTarget)
+                                            {
+                                                string actorName = GetEntityName(lookAtData.RoutingNetID, netIdToName);
+                                                string targetName = GetEntityName(lookAtData.TargetNetID, netIdToName);
+                                                AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] UNIT LOOK AT: {actorName} -> {targetName}", Brushes.LightSeaGreen, lookAtData, LogCategory.LookAt);
+                                            }
                                         }
                                     }
-                                    else if (packetId == 0xB0 && packet.ParsedData is S2C_PlayAnimationData animData && animData.RoutingNetID == tracker.CasterNetId)
-                                    {
-                                        AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] ANIMATION PLAYED: {animData.AnimationName}", Brushes.MediumPurple, animData);
-                                    }
-                                    else if (packetId == 0x29 && packet.ParsedData is S2C_StopAnimationData stopAnimData && stopAnimData.RoutingNetID == tracker.CasterNetId)
-                                    {
-                                        AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] ANIMATION STOPPED: {stopAnimData.AnimationName}", Brushes.MediumPurple, stopAnimData);
-                                    }
-                                    else if (packetId == 0x6B && packet.ParsedData is S2C_SetAnimStatesData animStateData && animStateData.RoutingNetID == tracker.CasterNetId)
-                                    {
-                                        AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] ANIMATION STATE OVERRIDE", Brushes.Plum, animStateData);
-                                    }
-                                    else if (packetId == 0x10F && packet.ParsedData is S2C_UnitSetLookAtData lookAtData && lookAtData.RoutingNetID == tracker.CasterNetId)
-                                    {
-                                        AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] UNIT LOOK AT", Brushes.LightSeaGreen, lookAtData);
-                                    }
-                                    else if (packetId == 0x6C && packet.ParsedData is S2C_ChainMissileSyncData chainData && chainData.OwnerNetworkID == tracker.CasterNetId)
-                                    {
-                                        AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] CHAIN MISSILE SYNC", Brushes.Gold, chainData);
-                                    }
                                 }
-                            }
 
-                            if (occurrencesFound >= maxOccurrences && activeTrackers.Count == 0) break;
+                                if (occurrencesFound >= maxOccurrences && activeTrackers.Count == 0) break;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogMessage($"Error parsing {Path.GetFileName(file)}: {ex.Message}", Brushes.Red);
                         }
                     }
-                    catch { /* Skip corrupted files */ }
-                }
 
-                LogMessage("\nScan Complete!", Brushes.LimeGreen);
-            });
+                    if (token.IsCancellationRequested)
+                        LogMessage("\nScan Stopped by User.", Brushes.Orange);
+                    else
+                        LogMessage("\nScan Complete!", Brushes.LimeGreen);
+                }, token);
+            }
+            finally
+            {
+                _scanCts?.Dispose();
+                _scanCts = null;
 
-            ScanButton.IsEnabled = true;
+                ScanButton.Content = "Start Scan";
+                ScanButton.ClearValue(Button.BackgroundProperty);
+                ScanButton.ClearValue(Button.ForegroundProperty);
+            }
         }
 
-        private async void ShowAllChampionEvents(string filePath, string targetChampion)
+        private async void ShowAllChampionEvents(string filePath, string targetChampion, string targetEntity)
         {
             OutputStack.Children.Clear();
-            LogMessage($"Dumping ALL events for {targetChampion} in {Path.GetFileName(filePath)}...", Brushes.Cyan);
+            string target = !string.IsNullOrEmpty(targetChampion) ? targetChampion : targetEntity;
+            LogMessage($"Dumping ALL events for {target} in {Path.GetFileName(filePath)}...", Brushes.Cyan);
+
+            bool includeTargeted = ChkIncludeTargeted.IsChecked == true;
+            int maxEntities = int.TryParse(MaxDumpTextBox.Text, out int md) ? md : 6;
 
             await Task.Run(() =>
             {
@@ -419,48 +569,66 @@ namespace InspectorGadget
                     using FileStream stream = File.OpenRead(filePath);
                     var packets = new ReplayReader().Parse(stream).ToList();
 
-                    float gameStartTime = 0;
-                    foreach (var p in packets)
-                    {
-                        if (p.Payload.Length > 0 && p.Payload.Span[0] == 0x5C)
-                        {
-                            gameStartTime = p.Time;
-                            break;
-                        }
-                    }
+                    float gameStartTime = packets.FirstOrDefault(p => p.Payload.Length > 0 && p.Payload.Span[0] == 0x5C)?.Time ?? 0;
 
-                    uint targetChampionNetId = 0;
-                    var mainContainer = AddLogExpander($"ALL EVENTS FOR {targetChampion}", Brushes.White, new { Info = "Click to expand all events" });
+                    HashSet<uint> targetNetIds = new HashSet<uint>();
+                    Dictionary<uint, string> netIdToName = new Dictionary<uint, string>();
+                    Dictionary<string, int> nameCounts = new Dictionary<string, int>();
+
+                    var allDumpEvents = new List<DumpEvent>();
 
                     foreach (var packet in packets)
                     {
                         if (packet.Payload.Length == 0) continue;
-                        byte packetId = packet.Payload.Span[0];
+                        uint packetId = packet.PacketId;
                         float realTimeMs = packet.Time - gameStartTime;
                         string timeStr = FormatTime(realTimeMs);
 
-                        if (packetId == 0x4C && packet.ParsedData is CreateHeroData heroData)
-                        {
-                            if (heroData.Skin.Replace(" ", "").Equals(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase))
-                                targetChampionNetId = heroData.NetID;
-                        }
+                        ProcessNameMapping(packet.ParsedData, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
 
-                        if (targetChampionNetId == 0) continue;
+                        if (targetNetIds.Count == 0) continue;
 
-                        if (packetId == 0xB5 && packet.ParsedData is NPC_CastSpellAnsData castData && castData.CasterNetID == targetChampionNetId)
+                        DumpEvent dumpEv = null;
+
+                        if (packetId == 0xB5 && packet.ParsedData is NPC_CastSpellAnsData castData)
                         {
-                            string name = GetNameFromHash(castData.SpellHash, _spellHashes);
-                            AddSubLog(mainContainer, $"[{timeStr}] SPELL CAST: {name}", Brushes.Yellow, castData);
+                            bool isCaster = targetNetIds.Contains(castData.CasterNetID);
+                            bool isTarget = includeTargeted && castData.TargetNetIDs.Any(id => targetNetIds.Contains(id));
+
+                            if (isCaster || isTarget)
+                            {
+                                string name = GetNameFromHash(castData.SpellHash, _spellHashes);
+                                string casterName = GetEntityName(castData.CasterNetID, netIdToName);
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = castData, Category = LogCategory.Spell, Color = Brushes.Yellow, LogText = $"[{timeStr}] SPELL CAST: {name} by {casterName}" };
+                                if (isCaster) dumpEv.InvolvedNetIds.Add(castData.CasterNetID);
+                                if (isTarget) foreach (var id in castData.TargetNetIDs) if (targetNetIds.Contains(id)) dumpEv.InvolvedNetIds.Add(id);
+                            }
                         }
-                        else if (packetId == 0x3B && packet.ParsedData is MissileReplicationData misData && misData.CasterNetID == targetChampionNetId)
+                        else if (packetId == 0x3B && packet.ParsedData is MissileReplicationData misData)
                         {
-                            string name = GetNameFromHash(misData.SpellHash, _spellHashes);
-                            AddSubLog(mainContainer, $"[{timeStr}] MISSILE: {name}", Brushes.Orange, misData);
+                            bool isCaster = targetNetIds.Contains(misData.CasterNetID);
+                            if (isCaster)
+                            {
+                                string name = GetNameFromHash(misData.SpellHash, _spellHashes);
+                                string casterName = GetEntityName(misData.CasterNetID, netIdToName);
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = misData, Category = LogCategory.Missile, Color = Brushes.Orange, LogText = $"[{timeStr}] MISSILE: {name} by {casterName}" };
+                                dumpEv.InvolvedNetIds.Add(misData.CasterNetID);
+                            }
                         }
-                        else if (packetId == 0xB7 && packet.ParsedData is NPC_BuffAdd2Data buffData && (buffData.CasterNetID == targetChampionNetId || buffData.RoutingNetID == targetChampionNetId))
+                        else if (packetId == 0xB7 && packet.ParsedData is NPC_BuffAdd2Data buffData)
                         {
-                            string name = GetNameFromHash(buffData.BuffNameHash, _buffHashes);
-                            AddSubLog(mainContainer, $"[{timeStr}] BUFF ADDED: {name}", Brushes.LightPink, buffData);
+                            bool isCaster = targetNetIds.Contains(buffData.CasterNetID);
+                            bool isTarget = includeTargeted && targetNetIds.Contains(buffData.RoutingNetID);
+
+                            if (isCaster || isTarget)
+                            {
+                                string name = GetNameFromHash(buffData.BuffNameHash, _buffHashes);
+                                string targetName = GetEntityName(buffData.RoutingNetID, netIdToName);
+                                string casterName = GetEntityName(buffData.CasterNetID, netIdToName);
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = buffData, Category = LogCategory.Buff, Color = Brushes.LightPink, LogText = $"[{timeStr}] BUFF: {name} | Caster: {casterName} -> Target: {targetName}" };
+                                if (isCaster) dumpEv.InvolvedNetIds.Add(buffData.CasterNetID);
+                                if (isTarget) dumpEv.InvolvedNetIds.Add(buffData.RoutingNetID);
+                            }
                         }
                         else if (packetId == 0x87 && packet.ParsedData is FXCreateGroupPacketData fxData)
                         {
@@ -468,37 +636,97 @@ namespace InspectorGadget
                             {
                                 foreach (var fx in group.FXCreateData)
                                 {
-                                    if (fx.TargetNetID == targetChampionNetId || fx.CasterNetID == targetChampionNetId)
+                                    bool isCaster = targetNetIds.Contains(fx.CasterNetID);
+                                    bool isTarget = includeTargeted && targetNetIds.Contains(fx.TargetNetID);
+
+                                    if (isCaster || isTarget)
                                     {
                                         string name = GetNameFromHash(group.EffectNameHash, _vfxHashes);
-                                        AddSubLog(mainContainer, $"[{timeStr}] VFX SPAWNED: {name}", Brushes.LightSkyBlue, group);
+                                        string casterName = GetEntityName(fx.CasterNetID, netIdToName);
+                                        string targetName = GetEntityName(fx.TargetNetID, netIdToName);
+                                        dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = group, Category = LogCategory.VFX, Color = Brushes.LightSkyBlue, LogText = $"[{timeStr}] VFX SPAWNED: {name} | Caster: {casterName} -> Target: {targetName}" };
+                                        if (isCaster) dumpEv.InvolvedNetIds.Add(fx.CasterNetID);
+                                        if (isTarget) dumpEv.InvolvedNetIds.Add(fx.TargetNetID);
                                     }
                                 }
                             }
                         }
+                        else if (packetId == 0xB0 && packet.ParsedData is S2C_PlayAnimationData animData && targetNetIds.Contains(animData.RoutingNetID))
+                        {
+                            string actorName = GetEntityName(animData.RoutingNetID, netIdToName);
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = animData, Category = LogCategory.Animation, Color = Brushes.MediumPurple, LogText = $"[{timeStr}] ANIMATION PLAYED: {animData.AnimationName} on {actorName}" };
+                            dumpEv.InvolvedNetIds.Add(animData.RoutingNetID);
+                        }
+                        else if (packetId == 0x10F && packet.ParsedData is S2C_UnitSetLookAtData lookAtData)
+                        {
+                            bool isActor = targetNetIds.Contains(lookAtData.RoutingNetID);
+                            bool isTarget = includeTargeted && targetNetIds.Contains(lookAtData.TargetNetID);
 
-                        else if (packetId == 0xB0 && packet.ParsedData is S2C_PlayAnimationData animData && animData.RoutingNetID == targetChampionNetId)
-                        {
-                            AddSubLog(mainContainer, $"[{timeStr}] ANIMATION PLAYED: {animData.AnimationName}", Brushes.MediumPurple, animData);
+                            if (isActor || isTarget)
+                            {
+                                string actorName = GetEntityName(lookAtData.RoutingNetID, netIdToName);
+                                string targetName = GetEntityName(lookAtData.TargetNetID, netIdToName);
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = lookAtData, Category = LogCategory.LookAt, Color = Brushes.LightSeaGreen, LogText = $"[{timeStr}] UNIT LOOK AT: {actorName} -> {targetName}" };
+                                if (isActor) dumpEv.InvolvedNetIds.Add(lookAtData.RoutingNetID);
+                                if (isTarget) dumpEv.InvolvedNetIds.Add(lookAtData.TargetNetID);
+                            }
                         }
-                        else if (packetId == 0x29 && packet.ParsedData is S2C_StopAnimationData stopAnimData && stopAnimData.RoutingNetID == targetChampionNetId)
+
+                        if (dumpEv != null)
                         {
-                            AddSubLog(mainContainer, $"[{timeStr}] ANIMATION STOPPED: {stopAnimData.AnimationName}", Brushes.MediumPurple, stopAnimData);
-                        }
-                        else if (packetId == 0x6B && packet.ParsedData is S2C_SetAnimStatesData animStateData && animStateData.RoutingNetID == targetChampionNetId)
-                        {
-                            AddSubLog(mainContainer, $"[{timeStr}] ANIMATION STATE OVERRIDE", Brushes.Plum, animStateData);
-                        }
-                        else if (packetId == 0x10F && packet.ParsedData is S2C_UnitSetLookAtData lookAtData && lookAtData.RoutingNetID == targetChampionNetId)
-                        {
-                            AddSubLog(mainContainer, $"[{timeStr}] UNIT LOOK AT", Brushes.LightSeaGreen, lookAtData);
-                        }
-                        else if (packetId == 0x6C && packet.ParsedData is S2C_ChainMissileSyncData chainData && chainData.OwnerNetworkID == targetChampionNetId)
-                        {
-                            AddSubLog(mainContainer, $"[{timeStr}] CHAIN MISSILE SYNC", Brushes.Gold, chainData);
+                            allDumpEvents.Add(dumpEv);
                         }
                     }
-                    LogMessage("Dump Complete!", Brushes.LimeGreen);
+
+                    if (allDumpEvents.Count == 0)
+                    {
+                        LogMessage("No events found for this target.", Brushes.Orange);
+                        return;
+                    }
+
+                    Dispatcher.Invoke(() =>
+                    {
+                        var mainExpander = new Expander { Header = $"ALL EVENTS FOR {target} ({allDumpEvents.Count} total)", Foreground = Brushes.White, IsExpanded = true, Margin = new Thickness(0, 5, 0, 5), FontFamily = new FontFamily("Consolas") };
+                        var mainPanel = new StackPanel { Margin = new Thickness(20, 5, 0, 5) };
+
+                        var comboPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+                        comboPanel.Children.Add(new TextBlock { Text = "Perspective: ", Foreground = Brushes.LightGray, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) });
+
+                        var perspectiveCombo = new ComboBox { Width = 300 };
+                        perspectiveCombo.Items.Add(new ComboBoxItem { Content = "All Instances", Tag = 0u });
+
+                        var activeNetIds = allDumpEvents.SelectMany(e => e.InvolvedNetIds).Distinct().Take(maxEntities).ToList();
+                        foreach (var netId in activeNetIds)
+                        {
+                            perspectiveCombo.Items.Add(new ComboBoxItem { Content = GetEntityName(netId, netIdToName), Tag = netId });
+                        }
+                        perspectiveCombo.SelectedIndex = 0;
+                        comboPanel.Children.Add(perspectiveCombo);
+                        mainPanel.Children.Add(comboPanel);
+
+                        var logsPanel = new StackPanel();
+                        mainPanel.Children.Add(logsPanel);
+                        mainExpander.Content = mainPanel;
+                        OutputStack.Children.Add(mainExpander);
+
+                        Action renderLogs = () =>
+                        {
+                            logsPanel.Children.Clear();
+                            uint selectedNetId = (uint)((ComboBoxItem)perspectiveCombo.SelectedItem).Tag;
+
+                            var filtered = selectedNetId == 0 ? allDumpEvents : allDumpEvents.Where(e => e.InvolvedNetIds.Contains(selectedNetId));
+
+                            foreach (var ev in filtered)
+                            {
+                                AddSubLog(logsPanel, ev.LogText, ev.Color, ev.ParsedData, ev.Category);
+                            }
+                        };
+
+                        perspectiveCombo.SelectionChanged += (s, e) => renderLogs();
+                        renderLogs();
+
+                        LogMessage("Dump Complete!", Brushes.LimeGreen);
+                    });
                 }
                 catch (Exception ex) { LogMessage($"Error: {ex.Message}", Brushes.Red); }
             });

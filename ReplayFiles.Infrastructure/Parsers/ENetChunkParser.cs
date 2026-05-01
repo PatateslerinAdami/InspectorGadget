@@ -191,6 +191,11 @@ public class ENetChunkParser : IChunkParser
             if (decryptedData.Length > 0)
             {
                 uint packetId = decryptedData[0];
+                if (packetId == 0xFE && decryptedData.Length >= 7)
+                {
+                    packetId = BinaryPrimitives.ReadUInt16LittleEndian(decryptedData.AsSpan().Slice(5, 2));
+                }
+
                 parsedObject = PacketRegistry.TryParse(packetId, decryptedData);
             }
 
@@ -275,6 +280,11 @@ public class ENetChunkParser : IChunkParser
             if (reconstructed.Length > 0)
             {
                 uint packetId = reconstructed[0];
+                if (packetId == 0xFE && reconstructed.Length >= 7)
+                {
+                    packetId = BinaryPrimitives.ReadUInt16LittleEndian(reconstructed.AsSpan(5, 2));
+                }
+
                 parsedObject = PacketRegistry.TryParse(packetId, reconstructed);
             }
 

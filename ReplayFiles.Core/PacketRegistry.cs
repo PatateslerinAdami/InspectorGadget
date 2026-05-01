@@ -19,6 +19,10 @@
             Register(0x6B, new S2C_SetAnimStatesParser());
             Register(0x29, new S2C_StopAnimationParser());
             Register(0xB0, new S2C_PlayAnimationParser());
+            Register(0xCF, new SpawnBotS2CParser());
+            Register(0xD0, new SpawnLevelPropS2CParser());
+            Register(0x123, new S2C_SpawnTurretParser());
+            Register(0xBA, new OnEnterVisibilityClientParser());
         }
 
         private static void Register(uint packetId, IPacketParser parser)
