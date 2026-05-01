@@ -23,6 +23,10 @@
             Register(0xD0, new SpawnLevelPropS2CParser());
             Register(0x123, new S2C_SpawnTurretParser());
             Register(0xBA, new OnEnterVisibilityClientParser());
+            Register(0x23, new AddRegionParser());
+            Register(0x24, new S2C_MoveRegionParser());
+            Register(0x33, new RemoveRegionParser());
+            Register(0x12E, new AddConeRegionParser());
         }
 
         private static void Register(uint packetId, IPacketParser parser)

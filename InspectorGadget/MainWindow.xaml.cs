@@ -25,7 +25,7 @@ namespace InspectorGadget
         public string CsvFolder { get; set; } = "";
     }
 
-    public enum LogCategory { None, Spell, Missile, Buff, VFX, Animation, LookAt }
+    public enum LogCategory { None, Spell, Missile, Buff, VFX, Animation, LookAt, Region}
 
     public partial class MainWindow : Window
     {
@@ -99,6 +99,7 @@ namespace InspectorGadget
                 LogCategory.VFX => ChkVFX,
                 LogCategory.Animation => ChkAnimations,
                 LogCategory.LookAt => ChkLookAt,
+                LogCategory.Region => ChkRegions,
                 _ => null
             };
         }
@@ -512,6 +513,10 @@ namespace InspectorGadget
                                         {
                                             AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] ANIMATION PLAYED: {animData.AnimationName}", Brushes.MediumPurple, animData, LogCategory.Animation);
                                         }
+                                        else if (packetId == 0x6B && packet.ParsedData is S2C_SetAnimStatesData setAnimData && setAnimData.RoutingNetID == tracker.CasterNetId)
+                                        {
+                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] ANIM STATE SET: {setAnimData.AnimationOverrides.Count} overrides", Brushes.MediumPurple, setAnimData, LogCategory.Animation);
+                                        }
                                         else if (packetId == 0x10F && packet.ParsedData is S2C_UnitSetLookAtData lookAtData)
                                         {
                                             bool isActor = lookAtData.RoutingNetID == tracker.CasterNetId;
@@ -523,6 +528,22 @@ namespace InspectorGadget
                                                 string targetName = GetEntityName(lookAtData.TargetNetID, netIdToName);
                                                 AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] UNIT LOOK AT: {actorName} -> {targetName}", Brushes.LightSeaGreen, lookAtData, LogCategory.LookAt);
                                             }
+                                        }
+                                        else if (packetId == 0x23 && packet.ParsedData is AddRegionData regionData)
+                                        {
+                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] REGION ADDED: Type {regionData.RegionType} at {regionData.Position}", Brushes.LightGreen, regionData, LogCategory.Region);
+                                        }
+                                        else if (packetId == 0x24 && packet.ParsedData is S2C_MoveRegionData moveReg)
+                                        {
+                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] REGION MOVED: {moveReg.RegionNetID} to {moveReg.Position}", Brushes.LightGreen, moveReg, LogCategory.Region);
+                                        }
+                                        else if (packetId == 0x33 && packet.ParsedData is RemoveRegionData remReg)
+                                        {
+                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] REGION REMOVED: {remReg.RegionNetID}", Brushes.LightGreen, remReg, LogCategory.Region);
+                                        }
+                                        else if (packetId == 0x12E && packet.ParsedData is AddConeRegionData coneReg)
+                                        {
+                                            AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] CONE REGION ADDED: Type {coneReg.RegionType} at {coneReg.Position}", Brushes.LightGreen, coneReg, LogCategory.Region);
                                         }
                                     }
                                 }
@@ -572,6 +593,7 @@ namespace InspectorGadget
                     float gameStartTime = packets.FirstOrDefault(p => p.Payload.Length > 0 && p.Payload.Span[0] == 0x5C)?.Time ?? 0;
 
                     HashSet<uint> targetNetIds = new HashSet<uint>();
+                    HashSet<uint> globalRegionNetIds = new HashSet<uint>();
                     Dictionary<uint, string> netIdToName = new Dictionary<uint, string>();
                     Dictionary<string, int> nameCounts = new Dictionary<string, int>();
 
@@ -657,6 +679,19 @@ namespace InspectorGadget
                             dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = animData, Category = LogCategory.Animation, Color = Brushes.MediumPurple, LogText = $"[{timeStr}] ANIMATION PLAYED: {animData.AnimationName} on {actorName}" };
                             dumpEv.InvolvedNetIds.Add(animData.RoutingNetID);
                         }
+                        else if (packetId == 0x6B && packet.ParsedData is S2C_SetAnimStatesData setAnimData && targetNetIds.Contains(setAnimData.RoutingNetID))
+                        {
+                            string actorName = GetEntityName(setAnimData.RoutingNetID, netIdToName);
+                            dumpEv = new DumpEvent
+                            {
+                                TimeStr = timeStr,
+                                ParsedData = setAnimData,
+                                Category = LogCategory.Animation,
+                                Color = Brushes.MediumPurple,
+                                LogText = $"[{timeStr}] ANIM STATE SET: {setAnimData.AnimationOverrides.Count} overrides on {actorName}"
+                            };
+                            dumpEv.InvolvedNetIds.Add(setAnimData.RoutingNetID);
+                        }
                         else if (packetId == 0x10F && packet.ParsedData is S2C_UnitSetLookAtData lookAtData)
                         {
                             bool isActor = targetNetIds.Contains(lookAtData.RoutingNetID);
@@ -669,6 +704,63 @@ namespace InspectorGadget
                                 dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = lookAtData, Category = LogCategory.LookAt, Color = Brushes.LightSeaGreen, LogText = $"[{timeStr}] UNIT LOOK AT: {actorName} -> {targetName}" };
                                 if (isActor) dumpEv.InvolvedNetIds.Add(lookAtData.RoutingNetID);
                                 if (isTarget) dumpEv.InvolvedNetIds.Add(lookAtData.TargetNetID);
+                            }
+                        }
+                        else if (packetId == 0x23 && packet.ParsedData is AddRegionData regionData)
+                        {
+                            dumpEv = new DumpEvent
+                            {
+                                TimeStr = timeStr,
+                                ParsedData = regionData,
+                                Category = LogCategory.Region,
+                                Color = Brushes.LightGreen,
+                                LogText = $"[{timeStr}] REGION ADDED: Type {regionData.RegionType} at {regionData.Position}"
+                            };
+
+                            bool belongsToTarget = targetNetIds.Contains(regionData.UnitNetID) || targetNetIds.Contains(regionData.BubbleNetID);
+
+                            if (belongsToTarget)
+                            {
+                                if (regionData.UnitNetID != 0) dumpEv.InvolvedNetIds.Add(regionData.UnitNetID);
+                                if (regionData.BubbleNetID != 0) dumpEv.InvolvedNetIds.Add(regionData.BubbleNetID);
+
+                                targetNetIds.Add(regionData.RoutingNetID);
+                            }
+                            else
+                            {
+                                globalRegionNetIds.Add(regionData.RoutingNetID);
+                            }
+                        }
+                        else if (packetId == 0x24 && packet.ParsedData is S2C_MoveRegionData moveReg)
+                        {
+                            if (targetNetIds.Contains(moveReg.RegionNetID) || globalRegionNetIds.Contains(moveReg.RegionNetID))
+                            {
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = moveReg, Category = LogCategory.Region, Color = Brushes.LightGreen, LogText = $"[{timeStr}] REGION MOVED: {moveReg.RegionNetID} to {moveReg.Position}" };
+
+                                if (targetNetIds.Contains(moveReg.RegionNetID)) dumpEv.InvolvedNetIds.Add(moveReg.RegionNetID);
+                            }
+                        }
+                        else if (packetId == 0x33 && packet.ParsedData is RemoveRegionData remReg)
+                        {
+                            if (targetNetIds.Contains(remReg.RegionNetID) || globalRegionNetIds.Contains(remReg.RegionNetID))
+                            {
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = remReg, Category = LogCategory.Region, Color = Brushes.LightGreen, LogText = $"[{timeStr}] REGION REMOVED: {remReg.RegionNetID}" };
+
+                                if (targetNetIds.Contains(remReg.RegionNetID)) dumpEv.InvolvedNetIds.Add(remReg.RegionNetID);
+                            }
+                        }
+                        else if (packetId == 0x12E && packet.ParsedData is AddConeRegionData coneReg)
+                        {
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = coneReg, Category = LogCategory.Region, Color = Brushes.LightGreen, LogText = $"[{timeStr}] CONE REGION ADDED: Type {coneReg.RegionType} at {coneReg.Position}" };
+
+                            if (targetNetIds.Contains(coneReg.UnitNetID))
+                            {
+                                dumpEv.InvolvedNetIds.Add(coneReg.UnitNetID);
+                                targetNetIds.Add(coneReg.RoutingNetID);
+                            }
+                            else
+                            {
+                                globalRegionNetIds.Add(coneReg.RoutingNetID);
                             }
                         }
 

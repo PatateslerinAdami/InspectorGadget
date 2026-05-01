@@ -59,6 +59,7 @@
                         <CheckBox x:Name="ChkVFX" Content="VFX" IsChecked="True" Foreground="White" Margin="0,2"/>
                         <CheckBox x:Name="ChkAnimations" Content="Animations" IsChecked="True" Foreground="White" Margin="0,2"/>
                         <CheckBox x:Name="ChkLookAt" Content="LookAt" IsChecked="True" Foreground="White" Margin="0,2"/>
+                        <CheckBox x:Name="ChkRegions" Content="Regions" IsChecked="True" Foreground="White" Margin="0,2"/>
                         <Separator Margin="0,5" Background="#3E3E42"/>
                         <CheckBox x:Name="ChkIncludeTargeted" Content="Include Targeted (Enemy hitting us)" IsChecked="True" Foreground="#FF6347" FontWeight="Bold" Margin="0,2" ToolTip="Requires Rescan to apply"/>
                     </StackPanel>
