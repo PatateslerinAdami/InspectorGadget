@@ -35,9 +35,8 @@ public class SpawnBotS2CParser : GamePacketParser
         data.TeamID = (ushort)(bitfield & 0x1FF);
 
         data.SkinID = reader.ReadInt32LittleEndian();
-        data.Name = reader.ReadFixedString(64);
-
-        data.SkinName = reader.ReadFixedString(64);
+        data.Name = reader.ReadFixedString(64).TrimEnd('\0');
+        data.SkinName = reader.ReadFixedString(64).TrimEnd('\0');
 
         data.BytesRemaining = reader.Remaining;
         return data;

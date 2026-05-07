@@ -42,8 +42,8 @@ public class SpawnLevelPropS2CParser : GamePacketParser
 
         data.Type = (byte)reader.ReadUInt32LittleEndian();
 
-        data.Name = reader.ReadFixedString(64);
-        data.PropName = reader.ReadFixedString(64);
+        data.Name = reader.ReadFixedString(64).TrimEnd('\0');
+        data.PropName = reader.ReadFixedString(64).TrimEnd('\0');
 
         data.BytesRemaining = reader.Remaining;
         return data;

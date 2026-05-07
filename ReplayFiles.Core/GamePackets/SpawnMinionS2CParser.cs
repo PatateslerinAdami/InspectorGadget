@@ -56,8 +56,8 @@ public class SpawnMinionS2CParser : GamePacketParser
         data.IsTargetableToTeamSpellFlags = reader.ReadUInt32LittleEndian();
         data.VisibilitySize = reader.ReadSingleLittleEndian();
 
-        data.Name = reader.ReadFixedString(64);
-        data.SkinName = reader.ReadFixedString(64);
+        data.Name = reader.ReadFixedString(64).TrimEnd('\0');
+        data.SkinName = reader.ReadFixedString(64).TrimEnd('\0');
 
         data.InitialLevel = reader.ReadUInt16LittleEndian();
         data.OnlyVisibleToNetID = reader.ReadUInt32LittleEndian();

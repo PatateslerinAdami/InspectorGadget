@@ -27,6 +27,11 @@
             Register(0x24, new S2C_MoveRegionParser());
             Register(0x33, new RemoveRegionParser());
             Register(0x12E, new AddConeRegionParser());
+            Register(0x61, new WaypointGroupParser());
+            Register(0x64, new WaypointGroupWithSpeedParser());
+            Register(0xB9, new WaypointListParser());
+            Register(0x83, new WaypointListHeroWithSpeedParser());
+            Register(0x3C, new MovementDriverReplicationParser());
         }
 
         private static void Register(uint packetId, IPacketParser parser)
@@ -36,9 +41,16 @@
 
         public static object? TryParse(uint packetId, ReadOnlySpan<byte> payload)
         {
-            if (_parsers.TryGetValue(packetId, out var parser))
+            try
             {
-                return parser.Parse(payload);
+                if (_parsers.TryGetValue(packetId, out var parser))
+                {
+                    return parser.Parse(payload);
+                }
+            }
+            catch
+            {
+
             }
             return null;
         }

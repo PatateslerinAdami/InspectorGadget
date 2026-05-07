@@ -1,5 +1,6 @@
 ﻿using Microsoft.Win32;
 using ReplayFiles.Core;
+using ReplayFiles.Core.GamePackets;
 using ReplayFiles.Infrastructure;
 using System;
 using System.Collections.Generic;
@@ -7,15 +8,13 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Media;
-using System.Text.Json.Serialization;
-using ReplayFiles.Core.GamePackets;
 
 namespace InspectorGadget
 {
@@ -25,7 +24,7 @@ namespace InspectorGadget
         public string CsvFolder { get; set; } = "";
     }
 
-    public enum LogCategory { None, Spell, Missile, Buff, VFX, Animation, LookAt, Region}
+    public enum LogCategory { None, Spell, Missile, Buff, VFX, Animation, LookAt, Region, Spawn, Movement }
 
     public partial class MainWindow : Window
     {
@@ -100,6 +99,8 @@ namespace InspectorGadget
                 LogCategory.Animation => ChkAnimations,
                 LogCategory.LookAt => ChkLookAt,
                 LogCategory.Region => ChkRegions,
+                LogCategory.Spawn => ChkSpawns,
+                LogCategory.Movement => ChkMovement,
                 _ => null
             };
         }
@@ -271,36 +272,95 @@ namespace InspectorGadget
                 : TimeSpan.FromMilliseconds(realTimeMs).ToString(@"mm\:ss\.fff");
         }
 
+        private HashSet<uint> ExtractMovementNetIds(object parsedData)
+        {
+            var ids = new HashSet<uint>();
+            if (parsedData is WaypointGroupData wg)
+            {
+                if (wg.SenderNetID != 0) ids.Add(wg.SenderNetID);
+                foreach (var m in wg.Movements)
+                {
+                    if (m.UnitNetID != 0) ids.Add(m.UnitNetID);
+                    if (m.SpeedParams?.FollowNetID != 0 && m.SpeedParams != null) ids.Add(m.SpeedParams.FollowNetID);
+                }
+            }
+            else if (parsedData is WaypointListHeroWithSpeedData wl)
+            {
+                if (wl.SenderNetID != 0) ids.Add(wl.SenderNetID);
+                if (wl.SpeedParams?.FollowNetID != 0 && wl.SpeedParams != null) ids.Add(wl.SpeedParams.FollowNetID);
+            }
+            else if (parsedData is MovementDriverReplicationData md)
+            {
+                if (md.SenderNetID != 0) ids.Add(md.SenderNetID);
+                if (md.HomingData?.TargetNetID != 0 && md.HomingData != null) ids.Add(md.HomingData.TargetNetID);
+            }
+            return ids;
+        }
+
+        private void ResolveFollowTargetNames(object parsedData, Dictionary<uint, string> netIdToName)
+        {
+            if (parsedData is WaypointGroupData wg)
+            {
+                foreach (var m in wg.Movements)
+                {
+                    if (m.SpeedParams != null && m.SpeedParams.FollowNetID != 0)
+                    {
+                        m.SpeedParams.FollowTargetName = GetEntityName(m.SpeedParams.FollowNetID, netIdToName);
+                    }
+                }
+            }
+            else if (parsedData is WaypointListHeroWithSpeedData wl)
+            {
+                if (wl.SpeedParams != null && wl.SpeedParams.FollowNetID != 0)
+                {
+                    wl.SpeedParams.FollowTargetName = GetEntityName(wl.SpeedParams.FollowNetID, netIdToName);
+                }
+            }
+            else if (parsedData is MovementDriverReplicationData md)
+            {
+                if (md.HomingData != null && md.HomingData.TargetNetID != 0)
+                {
+                    md.HomingData.TargetName = GetEntityName(md.HomingData.TargetNetID, netIdToName);
+                }
+            }
+        }
+
         private void ProcessNameMapping(object parsedData, Dictionary<uint, string> netIdToName, Dictionary<string, int> nameCounts, HashSet<uint> targetNetIds, string targetChampion, string targetEntity)
         {
             if (parsedData == null) return;
 
-            string baseName = null;
+            string displayBaseName = null;
+            string searchableNames = null;
             uint foundNetId = 0;
 
             if (parsedData is CreateHeroData hero)
             {
-                baseName = hero.Skin;
+                displayBaseName = hero.Skin;
+                searchableNames = hero.Skin + hero.Name;
                 foundNetId = hero.NetID;
             }
             else if (parsedData is SpawnMinionS2CData minion)
             {
-                baseName = string.IsNullOrEmpty(minion.Name) ? minion.SkinName : minion.Name;
+                displayBaseName = string.IsNullOrEmpty(minion.SkinName) ? minion.Name : minion.SkinName;
+                searchableNames = minion.Name + minion.SkinName;
                 foundNetId = minion.NetID;
             }
             else if (parsedData is SpawnBotS2CData bot)
             {
-                baseName = bot.SkinName;
+                displayBaseName = bot.SkinName;
+                searchableNames = bot.SkinName + bot.Name;
                 foundNetId = bot.NetID;
             }
             else if (parsedData is SpawnLevelPropS2CData prop)
             {
-                baseName = prop.PropName;
+                displayBaseName = prop.PropName;
+                searchableNames = prop.PropName + prop.Name;
                 foundNetId = prop.NetID;
             }
             else if (parsedData is S2C_SpawnTurretData turret)
             {
-                baseName = turret.Name;
+                displayBaseName = turret.Name;
+                searchableNames = turret.Name;
                 foundNetId = turret.NetID;
             }
             else if (parsedData is OnEnterVisibilityClientData visData)
@@ -311,31 +371,36 @@ namespace InspectorGadget
                 }
                 foreach (var stack in visData.CharacterDataStack)
                 {
-                    RegisterEntity(stack.SkinName, stack.NetID, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
+                    RegisterEntity(stack.SkinName, stack.SkinName, stack.NetID, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
                 }
             }
 
-            if (baseName != null && foundNetId != 0)
+            if (displayBaseName != null && foundNetId != 0)
             {
-                RegisterEntity(baseName, foundNetId, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
+                RegisterEntity(displayBaseName, searchableNames, foundNetId, netIdToName, nameCounts, targetNetIds, targetChampion, targetEntity);
             }
         }
 
-        private void RegisterEntity(string baseName, uint netId, Dictionary<uint, string> netIdToName, Dictionary<string, int> nameCounts, HashSet<uint> targetNetIds, string targetChampion, string targetEntity)
+        private void RegisterEntity(string displayBaseName, string searchableNames, uint netId, Dictionary<uint, string> netIdToName, Dictionary<string, int> nameCounts, HashSet<uint> targetNetIds, string targetChampion, string targetEntity)
         {
+            if (!targetNetIds.Contains(netId))
+            {
+                bool matchChamp = !string.IsNullOrEmpty(targetChampion) && searchableNames.Replace(" ", "").Contains(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase);
+                bool matchEntity = !string.IsNullOrEmpty(targetEntity) && searchableNames.Replace(" ", "").Contains(targetEntity.Replace(" ", ""), StringComparison.OrdinalIgnoreCase);
+
+                if (matchChamp || matchEntity)
+                {
+                    targetNetIds.Add(netId);
+                }
+            }
+
             if (netIdToName.ContainsKey(netId)) return;
 
-            if (!nameCounts.ContainsKey(baseName)) nameCounts[baseName] = 1;
-            else nameCounts[baseName]++;
+            if (!nameCounts.ContainsKey(displayBaseName)) nameCounts[displayBaseName] = 1;
+            else nameCounts[displayBaseName]++;
 
-            string indexedName = nameCounts[baseName] > 1 ? $"{baseName}_{nameCounts[baseName]}" : baseName;
+            string indexedName = nameCounts[displayBaseName] > 1 ? $"{displayBaseName}_{nameCounts[displayBaseName]}" : displayBaseName;
             netIdToName[netId] = indexedName;
-
-            if ((!string.IsNullOrEmpty(targetChampion) && baseName.Replace(" ", "").Equals(targetChampion.Replace(" ", ""), StringComparison.OrdinalIgnoreCase)) ||
-                (!string.IsNullOrEmpty(targetEntity) && baseName.Replace(" ", "").Equals(targetEntity.Replace(" ", ""), StringComparison.OrdinalIgnoreCase)))
-            {
-                targetNetIds.Add(netId);
-            }
         }
 
         private async void ScanButton_Click(object sender, RoutedEventArgs e)
@@ -545,6 +610,26 @@ namespace InspectorGadget
                                         {
                                             AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] CONE REGION ADDED: Type {coneReg.RegionType} at {coneReg.Position}", Brushes.LightGreen, coneReg, LogCategory.Region);
                                         }
+                                        else if (packetId == 0x61 || packetId == 0x64 || packetId == 0xB9 || packetId == 0x83 || packetId == 0x3C)
+                                        {
+                                            var movementNetIds = ExtractMovementNetIds(packet.ParsedData);
+                                            if (movementNetIds.Contains(tracker.CasterNetId))
+                                            {
+                                                string moveType = packetId switch
+                                                {
+                                                    0x61 => "WaypointGroup",
+                                                    0x64 => "WaypointGroupWithSpeed",
+                                                    0xB9 => "WaypointList",
+                                                    0x83 => "WaypointListHeroWithSpeed",
+                                                    0x3C => "MovementDriverReplication",
+                                                    _ => "Unknown Movement"
+                                                };
+
+                                                ResolveFollowTargetNames(packet.ParsedData, netIdToName);
+
+                                                AddSubLog(tracker.UIContainer, $"[+{timeOffsetMs:0}ms] MOVEMENT: {moveType}", Brushes.LightGreen, packet.ParsedData, LogCategory.Movement);
+                                            }
+                                        }
                                     }
                                 }
 
@@ -612,7 +697,42 @@ namespace InspectorGadget
 
                         DumpEvent dumpEv = null;
 
-                        if (packetId == 0xB5 && packet.ParsedData is NPC_CastSpellAnsData castData)
+                        if (packetId == 0x4C && packet.ParsedData is CreateHeroData hero && targetNetIds.Contains(hero.NetID))
+                        {
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = hero, Category = LogCategory.Spawn, Color = Brushes.Cyan, LogText = $"[{timeStr}] HERO CREATED: {hero.Skin}" };
+                            dumpEv.InvolvedNetIds.Add(hero.NetID);
+                        }
+                        else if (packetId == 0x7C && packet.ParsedData is SpawnMinionS2CData minion && targetNetIds.Contains(minion.NetID))
+                        {
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = minion, Category = LogCategory.Spawn, Color = Brushes.Cyan, LogText = $"[{timeStr}] MINION SPAWNED: {minion.SkinName} (Name: {minion.Name})" };
+                            dumpEv.InvolvedNetIds.Add(minion.NetID);
+                        }
+                        else if (packetId == 0xCF && packet.ParsedData is SpawnBotS2CData bot && targetNetIds.Contains(bot.NetID))
+                        {
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = bot, Category = LogCategory.Spawn, Color = Brushes.Cyan, LogText = $"[{timeStr}] BOT SPAWNED: {bot.SkinName} (Name: {bot.Name})" };
+                            dumpEv.InvolvedNetIds.Add(bot.NetID);
+                        }
+                        else if (packetId == 0xD0 && packet.ParsedData is SpawnLevelPropS2CData prop && targetNetIds.Contains(prop.NetID))
+                        {
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = prop, Category = LogCategory.Spawn, Color = Brushes.Cyan, LogText = $"[{timeStr}] LEVEL PROP SPAWNED: {prop.PropName} (Name: {prop.Name})" };
+                            dumpEv.InvolvedNetIds.Add(prop.NetID);
+                        }
+                        else if (packetId == 0x123 && packet.ParsedData is S2C_SpawnTurretData turret && targetNetIds.Contains(turret.NetID))
+                        {
+                            dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = turret, Category = LogCategory.Spawn, Color = Brushes.Cyan, LogText = $"[{timeStr}] TURRET SPAWNED: {turret.Name}" };
+                            dumpEv.InvolvedNetIds.Add(turret.NetID);
+                        }
+                        else if (packetId == 0xBA && packet.ParsedData is OnEnterVisibilityClientData visData)
+                        {
+                            var involvedIds = visData.CharacterDataStack.Select(c => c.NetID).Where(id => targetNetIds.Contains(id)).ToList();
+                            if (involvedIds.Any())
+                            {
+                                string names = string.Join(", ", involvedIds.Select(id => GetEntityName(id, netIdToName)));
+                                dumpEv = new DumpEvent { TimeStr = timeStr, ParsedData = visData, Category = LogCategory.Spawn, Color = Brushes.Cyan, LogText = $"[{timeStr}] ENTERED VISIBILITY: {names}" };
+                                foreach (var id in involvedIds) dumpEv.InvolvedNetIds.Add(id);
+                            }
+                        }
+                        else if (packetId == 0xB5 && packet.ParsedData is NPC_CastSpellAnsData castData)
                         {
                             bool isCaster = targetNetIds.Contains(castData.CasterNetID);
                             bool isTarget = includeTargeted && castData.TargetNetIDs.Any(id => targetNetIds.Contains(id));
@@ -763,6 +883,36 @@ namespace InspectorGadget
                                 globalRegionNetIds.Add(coneReg.RoutingNetID);
                             }
                         }
+                        else if (packetId == 0x61 || packetId == 0x64 || packetId == 0xB9 || packetId == 0x83 || packetId == 0x3C)
+                        {
+                            var movementNetIds = ExtractMovementNetIds(packet.ParsedData);
+                            bool isRelated = movementNetIds.Any(id => targetNetIds.Contains(id));
+
+                            if (isRelated)
+                            {
+                                string moveType = packetId switch
+                                {
+                                    0x61 => "WaypointGroup",
+                                    0x64 => "WaypointGroupWithSpeed",
+                                    0xB9 => "WaypointList",
+                                    0x83 => "WaypointListHeroWithSpeed",
+                                    0x3C => "MovementDriverReplication",
+                                    _ => "Unknown Movement"
+                                };
+
+                                ResolveFollowTargetNames(packet.ParsedData, netIdToName);
+
+                                dumpEv = new DumpEvent
+                                {
+                                    TimeStr = timeStr,
+                                    ParsedData = packet.ParsedData,
+                                    Category = LogCategory.Movement,
+                                    Color = Brushes.LightGreen,
+                                    LogText = $"[{timeStr}] MOVEMENT: {moveType}"
+                                };
+                                foreach (var id in movementNetIds) dumpEv.InvolvedNetIds.Add(id);
+                            }
+                        }
 
                         if (dumpEv != null)
                         {
@@ -821,6 +971,56 @@ namespace InspectorGadget
                     });
                 }
                 catch (Exception ex) { LogMessage($"Error: {ex.Message}", Brushes.Red); }
+            });
+        }
+        private async void DumpPropsButton_Click(object sender, RoutedEventArgs e)
+        {
+            string folderPath = FolderPathTextBox.Text;
+            if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+            {
+                LogMessage("Please select a valid Replays Folder first!", Brushes.Red);
+                return;
+            }
+
+            OutputStack.Children.Clear();
+            LogMessage("Dumping ALL SpawnLevelPropS2CData packets...", Brushes.Cyan);
+
+            await Task.Run(() =>
+            {
+                var files = Directory.EnumerateFiles(folderPath, "*.lrf", SearchOption.AllDirectories).ToList();
+                int propCount = 0;
+
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        using FileStream stream = File.OpenRead(file);
+                        var packets = new ReplayReader().Parse(stream).ToList();
+                        float gameStartTime = packets.FirstOrDefault(p => p.Payload.Length > 0 && p.Payload.Span[0] == 0x5C)?.Time ?? 0;
+
+                        foreach (var packet in packets)
+                        {
+                            if (packet.Payload.Length == 0) continue;
+
+                            if (packet.PacketId == 0xD0 && packet.ParsedData is SpawnLevelPropS2CData prop)
+                            {
+                                propCount++;
+                                float realTimeMs = packet.Time - gameStartTime;
+                                string timeStr = FormatTime(realTimeMs);
+
+                                string header = $"[{timeStr}] LEVEL PROP: '{prop.PropName}' (Name: '{prop.Name}', NetID: {prop.NetID})";
+
+                                AddLogExpander(header, Brushes.Cyan, prop, LogCategory.None);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"Error parsing {Path.GetFileName(file)}: {ex.Message}", Brushes.Red);
+                    }
+                }
+
+                LogMessage($"Finished! Found {propCount} Level Props.", Brushes.LimeGreen);
             });
         }
     }

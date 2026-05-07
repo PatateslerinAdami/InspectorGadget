@@ -19,6 +19,7 @@
             <TextBlock Text="Replays Folder:" Foreground="White" VerticalAlignment="Center" Width="100"/>
             <TextBox x:Name="FolderPathTextBox" Width="400" Margin="0,0,10,0" VerticalContentAlignment="Center"/>
             <Button Content="Browse..." Width="80" Click="BrowseButton_Click"/>
+            <Button Content="Dump All Level Props" Click="DumpPropsButton_Click" Width="150" Margin="5"/>
         </StackPanel>
 
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
@@ -58,8 +59,10 @@
                         <CheckBox x:Name="ChkBuffs" Content="Buffs" IsChecked="True" Foreground="White" Margin="0,2"/>
                         <CheckBox x:Name="ChkVFX" Content="VFX" IsChecked="True" Foreground="White" Margin="0,2"/>
                         <CheckBox x:Name="ChkAnimations" Content="Animations" IsChecked="True" Foreground="White" Margin="0,2"/>
-                        <CheckBox x:Name="ChkLookAt" Content="LookAt" IsChecked="True" Foreground="White" Margin="0,2"/>
-                        <CheckBox x:Name="ChkRegions" Content="Regions" IsChecked="True" Foreground="White" Margin="0,2"/>
+                        <CheckBox x:Name="ChkLookAt" Content="LookAt" IsChecked="False" Foreground="White" Margin="0,2"/>
+                        <CheckBox x:Name="ChkRegions" Content="Regions" IsChecked="False" Foreground="White" Margin="0,2"/>
+                        <CheckBox x:Name="ChkSpawns" Content="Spawns/Visibility" IsChecked="False" Foreground="White" Margin="0,2"/>
+                        <CheckBox x:Name="ChkMovement" Content="Movement" IsChecked="False" Foreground="White" Margin="0,2"/>
                         <Separator Margin="0,5" Background="#3E3E42"/>
                         <CheckBox x:Name="ChkIncludeTargeted" Content="Include Targeted (Enemy hitting us)" IsChecked="True" Foreground="#FF6347" FontWeight="Bold" Margin="0,2" ToolTip="Requires Rescan to apply"/>
                     </StackPanel>
